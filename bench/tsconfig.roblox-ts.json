@@ -10,7 +10,7 @@
         "allowSyntheticDefaultImports": true,
         "forceConsistentCasingInFileNames": true,
         "rootDir": "./src",
-        "outDir": "./out/rotor/src",
+        "outDir": "./out/roblox-ts/src",
         "typeRoots": [
             "./node_modules/@rbxts"
         ],
@@ -27,6 +27,6 @@
         "./src/shared/fns.ts"
     ],
     "rbxts": {
-        "includePath": "out/rotor/include"
+        "includePath": "out/roblox-ts/include"
     }
 }

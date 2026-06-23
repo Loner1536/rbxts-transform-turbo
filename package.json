@@ -10,9 +10,10 @@
     ],
     "scripts": {
         "build": "tsc",
-        "bench:build": "npm run build && cd bench && ~/.rokit/bin/rotor build",
-        "bench:build:baseline": "cd bench && ~/.rokit/bin/rotor build -p tsconfig.notransform.json -i out/include",
-        "bench:rbxlx": "npm run bench:build && npm run bench:build:baseline && cd bench && ~/.rokit/bin/rojo build default.project.json -o benchmark.rbxlx"
+        "bench:rotor": "npm run build && cd bench && ~/.rokit/bin/rotor build",
+        "bench:roblox-ts": "npm run build && cd bench && ./node_modules/.bin/rbxtsc -p tsconfig.roblox-ts.json --rojo roblox-ts.project.json",
+        "bench:rbxlx:rotor": "npm run bench:rotor && cd bench && ~/.rokit/bin/rojo build rotor.project.json -o benchmark-rotor.rbxlx",
+        "bench:rbxlx:roblox-ts": "npm run bench:roblox-ts && cd bench && ~/.rokit/bin/rojo build roblox-ts.project.json -o benchmark-roblox-ts.rbxlx"
     },
     "keywords": [
         "roblox-ts",
