@@ -8,7 +8,7 @@
 >
 > **What's different:** The old package also annotated return types, local variable declarations, class methods, and user-defined interfaces/type aliases. Those are not yet in this package — they're planned but the implementation is non-trivial. The old package also had reliability issues that this rewrite addresses.
 
-A roblox-ts transformer that automatically applies Luau performance directives at compile time — no runtime cost, no code changes required.
+A TypeScript transformer for Roblox that automatically applies Luau performance directives at compile time — no runtime cost, no code changes required.
 
 ## Installation
 
@@ -38,7 +38,7 @@ npm install --save-dev rbxts-transform-boost
 | `optimize` | `boolean` | `true` | Prepend `--!optimize 2` to every file that doesn't already have it |
 | `hoist` | `boolean` | `true` | Hoist `GetService` calls and repeated property reads to locals |
 
-`--!native` is never auto-inserted. Add `//!native` at the top of your TypeScript file for hot paths you've profiled — rotor preserves it.
+`--!native` is never auto-inserted. Add `//!native` at the top of your TypeScript file for hot paths you've profiled — the compiler preserves it.
 
 ```typescript
 //!native
@@ -67,7 +67,6 @@ export function encodeFixed(buf: buffer, offset: number, value: number, scale: n
 
 ```lua
 -- Without transformer
--- Compiled with rotor v2.2.0
 local function encodeFixed(buf, offset, value, scale)
     local fixed = math.floor(value * scale)
     local clamped = math.clamp(fixed, -32768, 32767)
@@ -79,7 +78,6 @@ end
 ```lua
 -- With transformer
 --!optimize 2
--- Compiled with rotor v2.2.0
 local function encodeFixed(buf: buffer, offset: number, value: number, scale: number)
     local fixed = math.floor(value * scale)
     local clamped = math.clamp(fixed, -32768, 32767)
@@ -92,7 +90,7 @@ end
 
 ### GetService hoisting
 
-Every `game:GetService("X")` call in a file is hoisted to a module-level local on first load. Functions that call `GetService` on every invocation — the most common pattern in rotor output — pay the registry lookup cost zero times at runtime.
+Every `game:GetService("X")` call in a file is hoisted to a module-level local on first load. Functions that call `GetService` on every invocation — the most common compiled pattern — pay the registry lookup cost zero times at runtime.
 
 ```typescript
 // TypeScript source
@@ -211,7 +209,7 @@ end
 
 ### Loop bounds hoisting
 
-`arr.size()` in a `for` loop condition is re-evaluated on every iteration in rotor's output. The loops pass hoists it to a `const` before the loop.
+`arr.size()` in a `for` loop condition is re-evaluated on every iteration in compiled output. The loops pass hoists it to a `const` before the loop.
 
 ```typescript
 // TypeScript source
@@ -253,7 +251,7 @@ end
 
 ### Luau type annotation injection
 
-After rotor writes `.luau` files, the transformer injects Luau type annotations on function parameters. This lets the native compiler generate specialized code for numeric and Roblox value types.
+After the compiler writes `.luau` files, the transformer injects Luau type annotations on function parameters. This lets the native compiler generate specialized code for numeric and Roblox value types.
 
 ```typescript
 // TypeScript source
