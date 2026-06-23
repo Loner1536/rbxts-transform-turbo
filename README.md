@@ -4,11 +4,11 @@
 >
 > **What carried over:** Luau type annotation injection on function parameters for native codegen (primitives, Roblox value types, arrays).
 >
-> **What's new:** `--!optimize 2` on every file, `game:GetService()` hoisting to module-level locals, repeated property chain hoisting, loop bounds hoisting — all without needing `//!native` in every file.
+> **What's new:** `--!optimize 2` on every file, `game:GetService()` hoisting to module-level locals, repeated property chain hoisting, loop bounds hoisting, `const` keyword for TypeScript `const` declarations, output formatting so compiled files look human-written.
 >
-> **What's different:** The old package also annotated return types, local variable declarations, class methods, and user-defined interfaces/type aliases. Those are not yet in this package — they're planned but the implementation is non-trivial. The old package also had reliability issues that this rewrite addresses.
+> **What's different:** The old package also annotated return types, local variable declarations, class methods, and user-defined interfaces/type aliases. Those are not yet in this package — they're planned. The old package also had reliability issues that this rewrite addresses.
 
-A TypeScript transformer for Roblox that automatically applies Luau performance directives at compile time — no runtime cost, no code changes required.
+A TypeScript transformer for Roblox that automatically applies Luau performance directives and cleans up compiled output at build time — no runtime cost, no code changes required.
 
 ## Installation
 
@@ -24,6 +24,7 @@ npm install --save-dev rbxts-transform-boost
             {
                 "transform": "rbxts-transform-boost",
                 "optimize": true,
+                "strict": false,
                 "hoist": true
             }
         ]
@@ -36,6 +37,7 @@ npm install --save-dev rbxts-transform-boost
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `optimize` | `boolean` | `true` | Prepend `--!optimize 2` to every file that doesn't already have it |
+| `strict` | `boolean` | `false` | Prepend `--!strict` to every file that doesn't already have it |
 | `hoist` | `boolean` | `true` | Hoist `GetService` calls and repeated property reads to locals |
 
 `--!native` is never auto-inserted. Add `//!native` at the top of your TypeScript file for hot paths you've profiled — the compiler preserves it.
@@ -43,7 +45,7 @@ npm install --save-dev rbxts-transform-boost
 ```typescript
 //!native
 export function integrate(pos: Vector3, vel: Vector3, acc: Vector3, dt: number) {
-    ...
+    // ...
 }
 ```
 
@@ -53,17 +55,7 @@ export function integrate(pos: Vector3, vel: Vector3, acc: Vector3, dt: number) 
 
 ### `--!optimize 2` — always on top
 
-Every file gets `--!optimize 2` prepended if it doesn't already have it. Roblox already runs all scripts at optimization level 2, but the directive makes Studio behaviour match production and signals intent.
-
-```typescript
-// TypeScript source
-export function encodeFixed(buf: buffer, offset: number, value: number, scale: number): number {
-    const fixed = math.floor(value * scale);
-    const clamped = math.clamp(fixed, -32768, 32767);
-    buffer.writei16(buf, offset, clamped);
-    return offset + 2;
-}
-```
+Every file gets `--!optimize 2` prepended if it doesn't already have it. Roblox already runs all scripts at optimization level 2 in live games, but the directive makes Studio behaviour match production and signals intent.
 
 ```lua
 -- Without transformer
@@ -78,12 +70,34 @@ end
 ```lua
 -- With transformer
 --!optimize 2
-local function encodeFixed(buf: buffer, offset: number, value: number, scale: number)
-    local fixed = math.floor(value * scale)
-    local clamped = math.clamp(fixed, -32768, 32767)
+
+local function encodeFixed(buf: buffer, offset: number, value: number, scale: number): number
+    const fixed = math.floor(value * scale)
+    const clamped = math.clamp(fixed, -32768, 32767)
     buffer.writei16(buf, offset, clamped)
+
     return offset + 2
 end
+```
+
+---
+
+### `const` for TypeScript `const` declarations
+
+TypeScript `const` declarations are emitted as Luau `const` (shipped in Roblox Studio March 2026). TypeScript `let` stays as `local`. Rotor-generated internal variables (`_cache0`, `_shouldIncrement`, etc.) are not affected.
+
+```typescript
+// TypeScript
+const N = 100000;
+let i = 0;
+const elapsed = os.clock() - t0;
+```
+
+```lua
+-- Compiled output
+const N = 100000
+local i = 0
+const elapsed = os.clock() - t0
 ```
 
 ---
@@ -113,12 +127,15 @@ end
 ```lua
 -- With transformer
 --!optimize 2
-local _Players = game:GetService("Players")   -- hoisted once at module load
-local _RunService = game:GetService("RunService")
 
-local function serviceWork()
-    local count = #_Players:GetPlayers()
-    local running = _RunService:IsRunning()
+-- Services
+local _RunService = game:GetService("RunService")
+local _Players = game:GetService("Players")
+
+local function serviceWork(): string
+    const count = #_Players:GetPlayers()
+    const running = _RunService:IsRunning()
+
     return `{count}-{running}`
 end
 ```
@@ -144,8 +161,8 @@ export function cameraWork(camera: Camera): number {
 ```lua
 -- Without transformer
 local function cameraWork(camera)
-    local pos = camera.CFrame.Position   -- engine call #1
-    local look = camera.CFrame.LookVector -- engine call #2
+    local pos = camera.CFrame.Position
+    local look = camera.CFrame.LookVector
     local fov = camera.FieldOfView
     return pos.Magnitude + look.X + fov
 end
@@ -153,48 +170,28 @@ end
 
 ```lua
 -- With transformer
-local function cameraWork(camera: Camera)
-    local _cache0 = camera.CFrame         -- one engine call
-    local pos = _cache0.Position           -- local read
-    local look = _cache0.LookVector        -- local read
-    local fov = camera.FieldOfView
+local function cameraWork(camera: Camera): number
+    const _cache0 = camera.CFrame
+    const pos = _cache0.Position
+    const look = _cache0.LookVector
+    const fov = camera.FieldOfView
+
     return pos.Magnitude + look.X + fov
 end
 ```
 
 **1.5× faster.** Also hoists value type field reads (`.X`, `.Y`, `.Z`) when they appear multiple times — the `cross` function reads each component twice, so all six are hoisted:
 
-```typescript
-// TypeScript source
-export function cross(a: Vector3, b: Vector3): Vector3 {
-    return new Vector3(
-        a.Y * b.Z - a.Z * b.Y,
-        a.Z * b.X - a.X * b.Z,
-        a.X * b.Y - a.Y * b.X,
-    );
-}
-```
-
-```lua
--- Without transformer
-local function cross(a, b)
-    return Vector3.new(
-        a.Y * b.Z - a.Z * b.Y,
-        a.Z * b.X - a.X * b.Z,
-        a.X * b.Y - a.Y * b.X
-    )
-end
-```
-
 ```lua
 -- With transformer
-local function cross(a: Vector3, b: Vector3)
-    local _cache0 = a.Y  -- each component read twice → all hoisted
-    local _cache1 = b.Z
-    local _cache2 = a.Z
-    local _cache3 = b.Y
-    local _cache4 = b.X
-    local _cache5 = a.X
+local function cross(a: Vector3, b: Vector3): Vector3
+    const _cache0 = a.Y
+    const _cache1 = b.Z
+    const _cache2 = a.Z
+    const _cache3 = b.Y
+    const _cache4 = b.X
+    const _cache5 = a.X
+
     return Vector3.new(
         _cache0 * _cache1 - _cache2 * _cache3,
         _cache2 * _cache4 - _cache5 * _cache1,
@@ -209,7 +206,7 @@ end
 
 ### Loop bounds hoisting
 
-`arr.size()` in a `for` loop condition is re-evaluated on every iteration in compiled output. The loops pass hoists it to a `const` before the loop.
+`arr.size()` in a `for` loop condition is re-evaluated on every iteration in compiled output. The loops pass hoists it to a local before the loop.
 
 ```typescript
 // TypeScript source
@@ -226,7 +223,7 @@ export function sumWeighted(values: Array<number>, weights: Array<number>): numb
 -- Without transformer
 local function sumWeighted(values, weights)
     local total = 0
-    for i = 0, #values - 1 do   -- #values evaluated once per iteration
+    for i = 0, #values - 1 do
         total += values[i + 1] * weights[i + 1]
     end
     return total
@@ -235,12 +232,32 @@ end
 
 ```lua
 -- With transformer
-local function sumWeighted(values: {number}, weights: {number})
+local function sumWeighted(values: {number}, weights: {number}): number
     local total = 0
-    local _len_values = #values   -- hoisted: evaluated once total
-    for i = 0, _len_values - 1 do
-        total += values[i + 1] * weights[i + 1]
+
+    do
+        const _len_values = #values
+
+        do
+            local i = 0
+            local _shouldIncrement = false
+
+            while true do
+                if _shouldIncrement then
+                    i += 1
+                else
+                    _shouldIncrement = true
+                end
+
+                if not (i < _len_values) then
+                    break
+                end
+
+                total += values[i + 1] * weights[i + 1]
+            end
+        end
     end
+
     return total
 end
 ```
@@ -251,7 +268,7 @@ end
 
 ### Luau type annotation injection
 
-After the compiler writes `.luau` files, the transformer injects Luau type annotations on function parameters. This lets the native compiler generate specialized code for numeric and Roblox value types.
+After the compiler writes `.luau` files, the transformer injects Luau type annotations on function parameters and return types. This lets the native compiler generate specialized code for numeric and Roblox value types.
 
 ```typescript
 // TypeScript source
@@ -269,12 +286,57 @@ end
 
 ```lua
 -- With transformer
-local function dot(a: Vector3, b: Vector3)
+local function dot(a: Vector3, b: Vector3): number
     return a.X * b.X + a.Y * b.Y + a.Z * b.Z
 end
 ```
 
 Supported types: `number`, `string`, `boolean`, `Vector3`, `Vector2`, `CFrame`, `UDim2`, `Color3`, `buffer`, `Instance`, `BasePart`, `Player`, `Camera`, `RunService`, `Players`, `Workspace`, and array forms (`{number}`, `{Vector3}`, etc.).
+
+---
+
+### Output formatting
+
+The transformer post-processes every compiled `.luau` file so the output looks like a human wrote it, not a compiler.
+
+**Preamble organisation** — top-level declarations are sorted into labeled sections in dependency order. Sections are sorted by line length (longest first). If you put a comment before a group of imports in TypeScript, that comment becomes the section label:
+
+```typescript
+// Shared
+import * as utils from "../shared/utils";
+
+// Server
+import * as data from "../server/data";
+```
+
+```lua
+--!optimize 2
+--!native
+
+-- Compiled with rotor v2.2.0
+
+-- Runtime
+local TS = require(...)
+
+-- Services
+local _ReplicatedStorage = game:GetService("ReplicatedStorage")
+local _Workspace = game:GetService("Workspace")
+
+-- Shared
+local utils = TS.import(script, ...)
+
+-- Server
+local data = TS.import(script, ...)
+```
+
+**Spacing inside functions** — blank lines are added so blocks breathe:
+
+- Before `return` when it's not the only statement in the function
+- After `end` blocks when the next line is not another `end`, `else`, or `elseif`
+- Before block starters (`do`/`while`/`for`/`if`) when preceded by a group of `local`/`const` assignments
+- At `const` → `local` transitions
+
+**`--!` directives** are sorted by length and separated from the rotor header comment with a blank line.
 
 ---
 
@@ -314,8 +376,10 @@ Measured in Roblox Studio server context. 100,000 iterations per benchmark (10,0
 ## Development
 
 ```bash
-npm run build          # build the transformer
-npm run bench:rbxlx    # build both versions + produce bench/benchmark.rbxlx
+npm run build              # compile the transformer (tsc → dist/)
+npm run bench:build        # build the benchmark suite with transformer applied
+npm run bench:build:baseline  # build the baseline suite (no transformer)
+npm run bench:rbxlx        # produce bench/benchmark.rbxlx (both suites in one place)
 ```
 
-Open `bench/benchmark.rbxlx` in Roblox Studio and run the server. The optimized suite prints first, then the baseline suite, sequentially in the output window.
+Open `bench/benchmark.rbxlx` in Roblox Studio and run the server. The optimized suite prints first, then the baseline suite.

@@ -1,3 +1,5 @@
+//!native
+
 // ── Vector3 / physics ────────────────────────────────────────────────────────
 
 export function integrate(pos: Vector3, vel: Vector3, acc: Vector3, dt: number): [Vector3, Vector3] {

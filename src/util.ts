@@ -4,6 +4,10 @@ export function hasOptimizeDirective(sourceFile: ts.SourceFile): boolean {
     return /^--!optimize\b/m.test(sourceFile.text) || /^\/\/!optimize\b/m.test(sourceFile.text);
 }
 
+export function hasStrictDirective(sourceFile: ts.SourceFile): boolean {
+    return /^--!strict\b/m.test(sourceFile.text) || /^\/\/!strict\b/m.test(sourceFile.text);
+}
+
 export function chainKey(ts: typeof import("typescript"), node: ts.Expression): string | undefined {
     if (ts.isIdentifier(node)) return node.text;
     if (ts.isPropertyAccessExpression(node)) {

@@ -13,7 +13,7 @@
         "outDir": "./out/src",
         "typeRoots": [
             "./node_modules/@rbxts"
-        ],
+        ]
     },
     "include": [
         "./src/shared/fns-bare.ts"

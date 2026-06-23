@@ -39,7 +39,12 @@ type FnAnnotation = {
     ret: string | null;
 };
 
-const sidecar = new Map<string, Map<string, FnAnnotation>>();
+type FileSidecar = {
+    fns: Map<string, FnAnnotation>;
+    consts: Set<string>;
+};
+
+const sidecar = new Map<string, FileSidecar>();
 let hooked = false;
 
 function mapTypeNode(ts: typeof import("typescript"), typeNode: ts.TypeNode): string | null {
@@ -125,15 +130,25 @@ function collectAnnotations(
     sourceFile: ts.SourceFile,
     outPath: string,
 ): void {
-    const fileMap = sidecar.get(outPath) ?? new Map<string, FnAnnotation>();
-    sidecar.set(outPath, fileMap);
+    const entry = sidecar.get(outPath) ?? { fns: new Map<string, FnAnnotation>(), consts: new Set<string>() };
+    sidecar.set(outPath, entry);
 
     function visit(node: ts.Node): void {
         if (ts.isFunctionDeclaration(node) && node.name) {
             const params = node.parameters.map(p => luauTypeForParam(ts, checker, p));
             const ret = luauTypeForReturn(ts, checker, node);
             if (params.some(p => p !== null) || ret !== null) {
-                fileMap.set(node.name.text, { params, ret });
+                entry.fns.set(node.name.text, { params, ret });
+            }
+        }
+        if (ts.isVariableStatement(node)) {
+            const isConst = (node.declarationList.flags & ts.NodeFlags.Const) !== 0;
+            if (isConst) {
+                for (const decl of node.declarationList.declarations) {
+                    if (ts.isIdentifier(decl.name)) {
+                        entry.consts.add(decl.name.text);
+                    }
+                }
             }
         }
         ts.forEachChild(node, visit);
@@ -141,43 +156,89 @@ function collectAnnotations(
     visit(sourceFile);
 }
 
+function byLengthDesc(a: string, b: string): number {
+    return b.length - a.length;
+}
+
+type ImportGroup = { label: string; lines: string[] };
+
 function organizePreamble(src: string): string {
     const lines = src.split("\n");
     let i = 0;
 
-    // Collect leading directives and header comments
-    const directives: string[] = [];
+    // Collect --! directives separately from other leading comments
+    const shebang: string[] = [];
+    const header: string[] = [];
     while (i < lines.length && lines[i].startsWith("--")) {
-        directives.push(lines[i++]);
+        if (lines[i].startsWith("--!")) {
+            shebang.push(lines[i++]);
+        } else {
+            header.push(lines[i++]);
+        }
     }
+    shebang.sort(byLengthDesc);
 
-    // Collect all top-level local declarations before the first function/other code
     const services: string[] = [];
     const runtime: string[] = [];
-    const imports: string[] = [];
+    const importGroups: ImportGroup[] = [];
     const bindings: string[] = [];
+
+    let pendingLabel: string | null = null;
+    let currentImports: string[] = [];
+
+    function flushImports(): void {
+        if (currentImports.length > 0) {
+            importGroups.push({ label: pendingLabel ?? "-- Imports", lines: [...currentImports] });
+            currentImports = [];
+        }
+        pendingLabel = null;
+    }
 
     while (i < lines.length) {
         const line = lines[i];
-        if (line.trim() === "") { i++; continue; }
 
-        if (/^local \w+ = game:GetService\(/.test(line)) {
+        if (line.trim() === "") {
+            // Blank line = end of current import group
+            flushImports();
+            i++;
+            continue;
+        }
+
+        if (/^--!/.test(line)) {
+            // Rotor can emit --!native after preamble locals — hoist it up
+            shebang.push(line); shebang.sort(byLengthDesc); i++;
+        } else if (/^--/.test(line)) {
+            // User comment becomes the label for the next import group
+            flushImports();
+            pendingLabel = line; i++;
+        } else if (/^local \w+ = game:GetService\(/.test(line)) {
+            flushImports();
             services.push(line); i++;
         } else if (/^local \w+ = require\(/.test(line)) {
+            flushImports();
             runtime.push(line); i++;
         } else if (/^local \w+ = TS\.import\(/.test(line)) {
-            imports.push(line); i++;
+            currentImports.push(line); i++;
         } else if (/^local \w+ = \w+[\.\[]/.test(line) && !/^local function/.test(line)) {
+            flushImports();
             bindings.push(line); i++;
         } else {
             break;
         }
     }
+    flushImports();
 
-    const out: string[] = [...directives];
-    if (services.length > 0) out.push("", "-- Services", ...services);
+    services.sort(byLengthDesc);
+    bindings.sort(byLengthDesc);
+
+    const out: string[] = [...shebang];
+    if (header.length > 0) out.push("", ...header);
     if (runtime.length > 0) out.push("", "-- Runtime", ...runtime);
-    if (imports.length > 0) out.push("", "-- Imports", ...imports);
+    if (services.length > 0) out.push("", "-- Services", ...services);
+    for (const group of importGroups) {
+        group.lines.sort(byLengthDesc);
+        out.push("", group.label, ...group.lines);
+    }
     if (bindings.length > 0) out.push("", "-- Bindings", ...bindings);
     if (i < lines.length) out.push("", ...lines.slice(i));
 
@@ -210,13 +271,62 @@ function hoistGetService(src: string): string {
     return src.slice(0, insertAt) + decls + "\n" + src.slice(insertAt);
 }
 
-function injectAnnotations(luauPath: string, fileMap: Map<string, FnAnnotation>): void {
+function addSpacing(src: string): string {
+    const lines = src.split("\n");
+    const out: string[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        const prevOut = out.length > 0 ? out[out.length - 1] : "";
+        const prevTrimmed = prevOut.trim();
+        const alreadyBlank = prevTrimmed === "";
+
+        if (!alreadyBlank) {
+            // Blank before top-level local function
+            if (/^local function /.test(trimmed)) {
+                out.push("");
+            }
+            // Blank before return when it's not the first statement in its block
+            else if (
+                /^return\b/.test(trimmed) &&
+                !/\b(then|do|repeat)$/.test(prevTrimmed) &&
+                !/function\s*\([^)]*\)$/.test(prevTrimmed) &&
+                !/^local function /.test(prevTrimmed)
+            ) {
+                out.push("");
+            }
+            // Blank before a block starter (do/while/for/if/repeat) when prev is local/const
+            else if (/^(do\b|while |for |if |repeat\b)/.test(trimmed) && /^(local |const )/.test(prevTrimmed)) {
+                out.push("");
+            }
+            // Blank on const → local transition
+            else if (/^local /.test(trimmed) && /^const /.test(prevTrimmed)) {
+                out.push("");
+            }
+        }
+
+        out.push(line);
+
+        // Blank after `end` when next non-blank line is not end/else/elseif/until
+        if (trimmed === "end") {
+            const next = lines[i + 1]?.trim() ?? "";
+            if (next !== "" && !/^(end\b|else\b|elseif\b|until\b)/.test(next)) {
+                out.push("");
+            }
+        }
+    }
+
+    return out.join("\n");
+}
+
+function injectAnnotations(luauPath: string, entry: FileSidecar): void {
     if (!fs.existsSync(luauPath)) return;
     let src = fs.readFileSync(luauPath, "utf8");
     let changed = false;
 
     // Inject param + return type annotations
-    for (const [fnName, ann] of fileMap) {
+    for (const [fnName, ann] of entry.fns) {
         if (ann.params.every(p => p === null) && ann.ret === null) continue;
 
         const re = new RegExp(
@@ -236,6 +346,13 @@ function injectAnnotations(luauPath: string, fileMap: Map<string, FnAnnotation>)
         });
     }
 
+    // Replace local → const for TypeScript const declarations
+    for (const name of entry.consts) {
+        const re = new RegExp(`^(\\t*)local (${escapeRegex(name)}) =`, "m");
+        const next = src.replace(re, `$1const $2 =`);
+        if (next !== src) { src = next; changed = true; }
+    }
+
     // Hoist any repeated game:GetService() calls injected by the compiler
     const hoisted = hoistGetService(src);
     if (hoisted !== src) { src = hoisted; changed = true; }
@@ -243,6 +360,10 @@ function injectAnnotations(luauPath: string, fileMap: Map<string, FnAnnotation>)
     // Organize preamble into labeled sections
     const organized = organizePreamble(src);
     if (organized !== src) { src = organized; changed = true; }
+
+    // Add blank lines between top-level blocks for readability
+    const spaced = addSpacing(src);
+    if (spaced !== src) { src = spaced; changed = true; }
 
     if (changed) fs.writeFileSync(luauPath, src, "utf8");
 }
@@ -259,10 +380,10 @@ function installWatcher(outDir: string): void {
         if (!filename || !filename.endsWith(".luau")) return;
         const full = path.join(outDir, filename);
         if (seen.has(full)) return;
-        const fileMap = sidecar.get(full);
-        if (!fileMap) return;
+        const entry = sidecar.get(full);
+        if (!entry) return;
         seen.add(full);
-        try { injectAnnotations(full, fileMap); } catch { /* ignore */ }
+        try { injectAnnotations(full, entry); } catch { /* ignore */ }
     });
     watcher.unref();
 }
