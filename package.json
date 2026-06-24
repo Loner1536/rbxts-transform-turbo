@@ -1,6 +1,6 @@
 {
     "name": "rbxts-transform-boost",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "description": "roblox-ts transformer: automatic --!native, GetService hoisting, property chain caching, loop bounds hoisting, and Luau type annotation injection",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
