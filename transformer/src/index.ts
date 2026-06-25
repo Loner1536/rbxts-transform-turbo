@@ -3,7 +3,7 @@ import type { PluginConfig } from "./config";
 import { nativePass } from "./passes/native";
 import { cachePass } from "./passes/cache";
 import { loopsPass } from "./passes/loops";
-import { annotatePass } from "./passes/annotate";
+import { annotatePass, flushPendingFromPreviousRun } from "./passes/annotate";
 import { createDebugger } from "./debug";
 export type { PluginConfig };
 
@@ -11,8 +11,16 @@ export default function (
     program: ts.Program,
     config: PluginConfig = {},
 ): ts.TransformerFactory<ts.SourceFile> {
-    const { optimize = true, strict = true, hoist = true, verbose = false } = config;
+    const { optimize = false, optimizeLevel: rawOptimizeLevel = 2, strict = true, hoist = true, verbose = false } = config;
     const dbg = createDebugger(program, verbose);
+
+
+    const optimizeLevel = (([0, 1, 2] as const).includes(rawOptimizeLevel as 0 | 1 | 2)
+        ? rawOptimizeLevel
+        : 2) as 0 | 1 | 2;
+
+
+    flushPendingFromPreviousRun(dbg);
 
     return (ctx) => (sourceFile) => {
         if (sourceFile.fileName.endsWith("fns-bare.ts")) return sourceFile;
@@ -21,7 +29,7 @@ export default function (
         const errors: string[] = [];
 
         try {
-            annotatePass(ts, program, sourceFile);
+            annotatePass(ts, program, sourceFile, optimize, optimizeLevel, strict, dbg);
             let result = sourceFile;
             let cached = 0;
 
@@ -52,7 +60,6 @@ export default function (
             dbg.file(rel, { cached, errors });
             return result;
         } catch (err) {
-            // Unrecoverable — whole file failed
             const msg = err instanceof Error ? err.message : String(err);
             dbg.file(rel, { cached: 0, errors: [`fatal: ${msg} — using original`] });
             return sourceFile;

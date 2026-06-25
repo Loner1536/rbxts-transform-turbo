@@ -1,6 +1,7 @@
 import type ts from "typescript";
 import * as fs from "fs";
 import * as path from "path";
+import type { Debugger } from "../debug";
 
 const LUAU_TYPE: Record<string, string> = {
     number: "number",
@@ -42,10 +43,12 @@ type FnAnnotation = {
 type FileSidecar = {
     fns: Map<string, FnAnnotation>;
     consts: Set<string>;
+    optimize: boolean;
+    optimizeLevel: 0 | 1 | 2;
+    strict: boolean;
 };
 
 const sidecar = new Map<string, FileSidecar>();
-let hooked = false;
 
 function mapTypeNode(ts: typeof import("typescript"), typeNode: ts.TypeNode): string | null {
     if (ts.isTypeReferenceNode(typeNode)) {
@@ -108,7 +111,18 @@ function outPathForSource(sourceFile: ts.SourceFile, program: ts.Program): strin
     if (!rootDir) return null;
     const rel = path.relative(rootDir, sourceFile.fileName);
     if (rel.startsWith("..")) return null;
-    return path.join(outDir, rel.replace(/\.tsx?$/, ".luau"));
+
+    // roblox-ts renames index.ts/index.client.ts/index.server.ts to
+    // init.luau/init.client.luau/init.server.luau respectively, so that the
+    // containing directory itself becomes the ModuleScript with the file's
+    // siblings as its children (Rojo convention for "script with children").
+    // Every other filename is emitted as-is, just with its .ts/.tsx swapped
+    // for .luau — this rename only applies to the literal basename "index".
+    const dir = path.dirname(rel);
+    const base = path.basename(rel).replace(/\.tsx?$/, "");
+    const renamedBase = base.replace(/^index(?=$|\.)/, "init");
+
+    return path.join(outDir, dir, `${renamedBase}.luau`);
 }
 
 function commonRoot(files: readonly string[]): string | undefined {
@@ -129,8 +143,17 @@ function collectAnnotations(
     checker: ts.TypeChecker,
     sourceFile: ts.SourceFile,
     outPath: string,
+    optimize: boolean,
+    optimizeLevel: 0 | 1 | 2,
+    strict: boolean,
 ): void {
-    const entry = sidecar.get(outPath) ?? { fns: new Map<string, FnAnnotation>(), consts: new Set<string>() };
+    const entry = sidecar.get(outPath) ?? {
+        fns: new Map<string, FnAnnotation>(),
+        consts: new Set<string>(),
+        optimize,
+        optimizeLevel,
+        strict,
+    };
     sidecar.set(outPath, entry);
 
     function visit(node: ts.Node): void {
@@ -160,85 +183,61 @@ function byLengthDesc(a: string, b: string): number {
     return b.length - a.length;
 }
 
-type ImportGroup = { label: string; lines: string[] };
-
 function organizePreamble(src: string): string {
     const lines = src.split("\n");
     let i = 0;
 
-    // Collect --! directives separately from other leading comments
     const shebang: string[] = [];
-    const header: string[] = [];
-    while (i < lines.length && lines[i].startsWith("--")) {
-        if (lines[i].startsWith("--!")) {
-            shebang.push(lines[i++]);
-        } else {
-            header.push(lines[i++]);
-        }
-    }
-    shebang.sort(byLengthDesc);
-
+    const compiledLines: string[] = [];
+    const otherHeader: string[] = [];
     const services: string[] = [];
     const runtime: string[] = [];
-    const importGroups: ImportGroup[] = [];
+    const imports: string[] = [];
     const bindings: string[] = [];
 
-    let pendingLabel: string | null = null;
-    let currentImports: string[] = [];
-
-    function flushImports(): void {
-        if (currentImports.length > 0) {
-            importGroups.push({ label: pendingLabel ?? "-- Imports", lines: [...currentImports] });
-            currentImports = [];
-        }
-        pendingLabel = null;
-    }
-
+    // Classify every line at the top of the file until we hit real code
     while (i < lines.length) {
         const line = lines[i];
+        const trimmed = line.trim();
 
-        if (line.trim() === "") {
-            // Blank line = end of current import group
-            flushImports();
-            i++;
-            continue;
-        }
+        if (trimmed === "") { i++; continue; }
 
         if (/^--!/.test(line)) {
-            // Rotor can emit --!native after preamble locals — hoist it up
-            shebang.push(line); shebang.sort(byLengthDesc); i++;
+            shebang.push(line); i++;
+        } else if (/^-- Compiled/.test(line)) {
+            compiledLines.push(line); i++;
         } else if (/^--/.test(line)) {
-            // User comment becomes the label for the next import group
-            flushImports();
-            pendingLabel = line; i++;
+            // Skip existing section labels — we'll regenerate them
+            i++;
         } else if (/^local \w+ = game:GetService\(/.test(line)) {
-            flushImports();
             services.push(line); i++;
         } else if (/^local \w+ = require\(/.test(line)) {
-            flushImports();
             runtime.push(line); i++;
         } else if (/^local \w+ = TS\.import\(/.test(line)) {
-            currentImports.push(line); i++;
+            imports.push(line); i++;
+        } else if (/^TS\.import\(/.test(line)) {
+            // Side-effect import with no assignment
+            imports.push(line); i++;
         } else if (/^local \w+ = \w+[\.\[]/.test(line) && !/^local function/.test(line)) {
-            flushImports();
             bindings.push(line); i++;
         } else {
+            // Real code — stop classifying
             break;
         }
     }
-    flushImports();
 
+    shebang.sort(byLengthDesc);
     services.sort(byLengthDesc);
+    imports.sort(byLengthDesc);
     bindings.sort(byLengthDesc);
 
+    // Order: --! directives, -- Compiled, other headers, then sections
     const out: string[] = [...shebang];
-    if (header.length > 0) out.push("", ...header);
+    if (compiledLines.length > 0) out.push("", ...compiledLines);
+    if (otherHeader.length > 0) out.push("", ...otherHeader);
     if (services.length > 0) out.push("", "-- Services", ...services);
     if (runtime.length > 0) out.push("", "-- Runtime", ...runtime);
-    for (const group of importGroups) {
-        group.lines.sort(byLengthDesc);
-        out.push("", group.label, ...group.lines);
-    }
+    if (imports.length > 0) out.push("", "-- Imports", ...imports);
     if (bindings.length > 0) out.push("", "-- Bindings", ...bindings);
     if (i < lines.length) out.push("", ...lines.slice(i));
 
@@ -246,7 +245,6 @@ function organizePreamble(src: string): string {
 }
 
 function hoistGetService(src: string): string {
-    // Count occurrences of each game:GetService("X") call
     const re = /game:GetService\("([^"]+)"\)/g;
     const counts = new Map<string, number>();
     for (const m of src.matchAll(re)) {
@@ -256,7 +254,6 @@ function hoistGetService(src: string): string {
     const toHoist = [...counts.entries()].filter(([, n]) => n >= 2).map(([svc]) => svc);
     if (toHoist.length === 0) return src;
 
-    // Build locals and replace
     const decls = toHoist
         .map(svc => `local _${svc} = game:GetService("${svc}")`)
         .join("\n");
@@ -265,7 +262,6 @@ function hoistGetService(src: string): string {
         src = src.split(`game:GetService("${svc}")`).join(`_${svc}`);
     }
 
-    // Insert after any leading --! directives and the rotor header comment
     const insertAt = src.search(/^(?!--[!\s]|--\s*Compiled)/m);
     if (insertAt === -1) return decls + "\n" + src;
     return src.slice(0, insertAt) + decls + "\n" + src.slice(insertAt);
@@ -283,32 +279,24 @@ function addSpacing(src: string): string {
         const alreadyBlank = prevTrimmed === "";
 
         if (!alreadyBlank) {
-            // Blank before top-level local function
             if (/^local function /.test(trimmed)) {
                 out.push("");
-            }
-            // Blank before return when it's not the first statement in its block
-            else if (
+            } else if (
                 /^return\b/.test(trimmed) &&
                 !/\b(then|do|repeat)$/.test(prevTrimmed) &&
                 !/function\s*\([^)]*\)$/.test(prevTrimmed) &&
                 !/^local function /.test(prevTrimmed)
             ) {
                 out.push("");
-            }
-            // Blank before a block starter (do/while/for/if/repeat) when prev is local/const
-            else if (/^(do\b|while |for |if |repeat\b)/.test(trimmed) && /^(local |const )/.test(prevTrimmed)) {
+            } else if (/^(do\b|while |for |if |repeat\b)/.test(trimmed) && /^(local |const )/.test(prevTrimmed)) {
                 out.push("");
-            }
-            // Blank on const → local transition
-            else if (/^local /.test(trimmed) && /^const /.test(prevTrimmed)) {
+            } else if (/^local /.test(trimmed) && /^const /.test(prevTrimmed)) {
                 out.push("");
             }
         }
 
         out.push(line);
 
-        // Blank after `end` when next non-blank line is not end/else/elseif/until
         if (trimmed === "end") {
             const next = lines[i + 1]?.trim() ?? "";
             if (next !== "" && !/^(end\b|else\b|elseif\b|until\b)/.test(next)) {
@@ -326,7 +314,6 @@ function promoteConstIfUnmutated(src: string, name: string): string {
     const lines = src.split("\n");
     const escaped = escapeRegex(name);
     const declRe = new RegExp(`^(\\t*)local (${escaped}) =`);
-
     const reassignRe = new RegExp(
         `^\\t*${escaped}\\s*(?:\\+|-|\\*|/{1,2}|%|\\^|\\.\\.)?=(?!=)`,
     );
@@ -342,14 +329,9 @@ function promoteConstIfUnmutated(src: string, name: string): string {
             const line = lines[j];
             const trimmed = line.replace(/^\t*/, "");
             if (trimmed === "") continue;
-
             const indent = line.length - trimmed.length;
             if (indent < declIndent) break;
-
-            if (reassignRe.test(line)) {
-                mutated = true;
-                break;
-            }
+            if (reassignRe.test(line)) { mutated = true; break; }
         }
 
         if (!mutated) {
@@ -360,13 +342,30 @@ function promoteConstIfUnmutated(src: string, name: string): string {
     return lines.join("\n");
 }
 
-function injectAnnotations(luauPath: string, entry: FileSidecar): void {
-    if (!fs.existsSync(luauPath)) return;
+function injectAnnotations(luauPath: string, entry: FileSidecar, dbg: Debugger): void {
     if (writingFiles.has(luauPath)) return;
+    if (!fs.existsSync(luauPath)) {
+        // Expected for sidecar entries whose source compiled to nothing
+        // (pure type-only files, etc.) — not every entry has emitted output.
+        dbg.warn("annotate", `no emitted file at ${luauPath}, skipping`);
+        return;
+    }
+
     let src = fs.readFileSync(luauPath, "utf8");
     let changed = false;
 
-    // Inject param + return type annotations
+    // Inject --! directives at the very top if missing.
+    // nativePass no longer does this — we handle it here so the ordering
+    // is always correct regardless of where roblox-ts emits other content.
+    if (entry.strict && !src.includes("--!strict")) {
+        src = "--!strict\n" + src;
+        changed = true;
+    }
+    if (entry.optimize && !src.includes("--!optimize")) {
+        src = `--!optimize ${entry.optimizeLevel}\n` + src;
+        changed = true;
+    }
+
     for (const [fnName, ann] of entry.fns) {
         if (ann.params.every(p => p === null) && ann.ret === null) continue;
 
@@ -392,15 +391,12 @@ function injectAnnotations(luauPath: string, entry: FileSidecar): void {
         if (next !== src) { src = next; changed = true; }
     }
 
-    // Hoist any repeated game:GetService() calls injected by the compiler
     const hoisted = hoistGetService(src);
     if (hoisted !== src) { src = hoisted; changed = true; }
 
-    // Organize preamble into labeled sections
     const organized = organizePreamble(src);
     if (organized !== src) { src = organized; changed = true; }
 
-    // Add blank lines between top-level blocks for readability
     const spaced = addSpacing(src);
     if (spaced !== src) { src = spaced; changed = true; }
 
@@ -409,9 +405,11 @@ function injectAnnotations(luauPath: string, entry: FileSidecar): void {
         try {
             fs.writeFileSync(luauPath, src, "utf8");
         } finally {
+            // Release quickly — this is just to avoid reacting to our own
+            // write if anything else happens to be watching this path too.
             setTimeout(() => {
                 writingFiles.delete(luauPath);
-            }, 50);
+            }, 50).unref();
         }
     }
 }
@@ -420,39 +418,69 @@ function escapeRegex(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-let watcher: fs.FSWatcher | null = null;
-let quietTimer: ReturnType<typeof setTimeout> | null = null;
+/**
+ * roblox-ts hasn't written the .luau file to disk yet at the point our
+ * transformer runs on the .ts source — emit happens after the *entire*
+ * compilation's transform pipeline finishes, not shortly after each file's
+ * transformer call returns. There is no reliable per-file signal for "this
+ * specific .luau now exists and is final": not a directory watcher (raced
+ * against a shared quiet-period timer and could starve later files — see
+ * git history) and not polling either (caused every file's wait-loop to
+ * keep the process alive with ref'd timers, hanging the whole build, while
+ * still frequently losing the race against emit timing).
+ *
+ * Instead we register everything we know into `sidecar` as each source file
+ * is transformed (cheap, synchronous, no I/O), and run a single formatting
+ * pass over every entry once, after the whole compilation's emit step has
+ * actually finished — see flushPending below.
+ */
+function flushPending(dbg: Debugger): void {
+    for (const [luauPath, entry] of sidecar) {
+        try {
+            injectAnnotations(luauPath, entry, dbg);
+        } catch (err) {
+            dbg.warn("annotate", `failed to format ${luauPath}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+    sidecar.clear();
+}
 
-function installWatcher(outDir: string): void {
-    if (hooked) return;
-    hooked = true;
+let finalizeRegistered = false;
 
-    watcher = fs.watch(outDir, { recursive: true }, (_event, filename) => {
-        if (!filename || !filename.endsWith(".luau")) return;
-        const full = path.join(outDir, filename);
-        if (writingFiles.has(full)) return;
-        const entry = sidecar.get(full);
-        if (!entry) return;
-        try { injectAnnotations(full, entry); } catch { /* ignore */ }
+function registerFinalizer(dbg: Debugger): void {
+    if (finalizeRegistered) return;
+    finalizeRegistered = true;
 
-        if (quietTimer) clearTimeout(quietTimer);
-        quietTimer = setTimeout(() => {
-            watcher?.close();
-            watcher = null;
-        }, 200);
-    });
+    // Covers one-shot builds (`rbxtsc` with no -w): this is the only
+    // finalization point, and it's guaranteed to run after the compiler's
+    // synchronous emit-to-disk work is done, since Node can't reach the
+    // exit phase until that work has completed.
+    process.on("exit", () => flushPending(dbg));
+}
 
-    watcher.unref();
+/**
+ * Covers watch mode (`rbxtsc -w`): the transformer's outer factory function
+ * is re-invoked once per incremental compilation. By the time a *new*
+ * compilation starts, the *previous* one has already finished writing its
+ * output to disk — so flushing here, before processing the new batch of
+ * source files, formats everything from the prior run that the process-exit
+ * hook hasn't had a chance to run yet.
+ */
+export function flushPendingFromPreviousRun(dbg: Debugger): void {
+    flushPending(dbg);
 }
 
 export function annotatePass(
     ts: typeof import("typescript"),
     program: ts.Program,
     sourceFile: ts.SourceFile,
+    optimize: boolean,
+    optimizeLevel: 0 | 1 | 2,
+    strict: boolean,
+    dbg: Debugger,
 ): void {
     const outPath = outPathForSource(sourceFile, program);
     if (!outPath) return;
-    collectAnnotations(ts, program.getTypeChecker(), sourceFile, outPath);
-    installWatcher(program.getCompilerOptions().outDir!);
+    collectAnnotations(ts, program.getTypeChecker(), sourceFile, outPath, optimize, optimizeLevel, strict);
+    registerFinalizer(dbg);
 }
-
